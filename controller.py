@@ -22,29 +22,27 @@ from display import update_lcd, lcd_init
 from awscrt import io, mqtt
 from awsiot import mqtt_connection_builder
 
-# --- Project paths and AWS details (edit if needed) ---
 PROJECT_DIR = Path(__file__).resolve().parent
 CERT_PATH = PROJECT_DIR / "certs" / "certificate.pem.crt"
 KEY_PATH = PROJECT_DIR / "certs" / "private.pem.key"
-ROOT_CA_PATH = PROJECT_DIR / "certs" / "rootCA.pem"            # or AmazonRootCA1.pem
+ROOT_CA_PATH = PROJECT_DIR / "certs" / "rootCA.pem"
 AWS_ENDPOINT = "a1y1hr6wej3zxo-ats.iot.ap-southeast-2.amazonaws.com"
 AWS_CLIENT_ID = "AUTPlantMonitor202510011906"
 AWS_TOPIC = "plant/sensors/AUTPlantMonitor202510011906"
 
-# --- GPIO setup ---
 DHT11_PIN = 17
-SOIL_MOISTURE_PIN = 18
 FAN_PIN = 24
 PUMP_PIN = 23
 
 GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(DHT11_PIN, GPIO.OUT)
-GPIO.setup(SOIL_MOISTURE_PIN, GPIO.IN)
 GPIO.setup(FAN_PIN, GPIO.OUT)
 GPIO.setup(PUMP_PIN, GPIO.OUT)
 
-# --- I2C ADC setup ---
+SOIL_MOISTURE_ON_THRESHOLD = 130   # Pump ON if soil moisture > 130
+SOIL_MOISTURE_OFF_THRESHOLD = 110  # Pump OFF if soil moisture < 110
+
 I2C_BUS_NUM = 1
 PCF8591_ADDRESS = 0x48
 bus = SMBus(I2C_BUS_NUM)
@@ -54,13 +52,10 @@ def read_adc(channel=0):
         raise ValueError("ADC channel must be 0-3")
     bus.write_byte(PCF8591_ADDRESS, 0x40 + channel)
     time.sleep(0.05)
-    # read twice sometimes more reliable
     return bus.read_byte(PCF8591_ADDRESS)
 
-# --- BMP085 setup ---
 bmp_sensor = BMP085.BMP085(busnum=I2C_BUS_NUM)
 
-# --- DHT11 reading (primary) ---
 MAX_UNCHANGE_COUNT = 100
 STATE_INIT_PULL_DOWN = 1
 STATE_INIT_PULL_UP = 2
@@ -139,14 +134,8 @@ def read_dht11_dat():
     if the_bytes[4] != checksum:
         return False
 
-    # returns humidity, temperature (as original)
     return the_bytes[0], the_bytes[2]
 
-# --- Soil moisture ---
-def read_soil_moisture():
-    return GPIO.input(SOIL_MOISTURE_PIN)  # 1=Dry, 0=Wet
-
-# --- SQLite setup ---
 DB_PATH = PROJECT_DIR / "plant_data.db"
 conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 cursor = conn.cursor()
@@ -168,7 +157,6 @@ CREATE TABLE IF NOT EXISTS sensor_data (
 """)
 conn.commit()
 
-# --- AWS helper functions ---
 def dns_lookup_ok(hostname: str) -> bool:
     try:
         socket.gethostbyname(hostname)
@@ -177,20 +165,13 @@ def dns_lookup_ok(hostname: str) -> bool:
         return False
 
 def connect_aws():
-    """
-    Attempt to establish an MQTT over TLS connection to AWS IoT Core.
-    Returns mqtt_connection or None on failure.
-    """
-    # quick DNS check
     if not dns_lookup_ok(AWS_ENDPOINT):
         print(f"[AWS] DNS lookup failed for endpoint {AWS_ENDPOINT}", flush=True)
         return None
-
     try:
         event_loop_group = io.EventLoopGroup(1)
         host_resolver = io.DefaultHostResolver(event_loop_group)
         client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
-
         mqtt_connection = mqtt_connection_builder.mtls_from_path(
             endpoint=AWS_ENDPOINT,
             cert_filepath=str(CERT_PATH),
@@ -201,25 +182,18 @@ def connect_aws():
             clean_session=False,
             keep_alive_secs=30
         )
-
         print("[AWS] Connecting to AWS IoT Core...", flush=True)
         connect_future = mqtt_connection.connect()
-        connect_future.result()  # wait for connection
+        connect_future.result()
         print("[AWS] Connected to AWS IoT Core", flush=True)
         return mqtt_connection
-
     except Exception as e:
         print(f"[AWS] Connect failed: {e}", flush=True)
         return None
 
 def log_to_aws(mqtt_connection, data: dict):
-    """
-    Publish a JSON payload to the configured topic using an existing mqtt_connection.
-    Raises exception on publish failure.
-    """
     if mqtt_connection is None:
         raise RuntimeError("No MQTT connection available")
-
     payload_json = json.dumps(data)
     mqtt_connection.publish(
         topic=AWS_TOPIC,
@@ -228,7 +202,6 @@ def log_to_aws(mqtt_connection, data: dict):
     )
     print(f"[AWS] Published to {AWS_TOPIC}: {payload_json}", flush=True)
 
-# --- Main loop ---
 def main():
     lcd_init()
     update_lcd("The IoTeam", "Plant Monitoring")
@@ -238,8 +211,8 @@ def main():
 
     print("Plant Monitoring System Started", flush=True)
     print("="*160, flush=True)
-    print("{:<6} {:<6} {:<6} {:<4} {:<4} {:<4} {:<4} {:<6} {:<6} {:<6} {:<6} {:<6}".format(
-        "Time","T","H","S","P","F","A","D","BMP_T","BMP_P","Photo","AWS"
+    print("{:<6} {:<6} {:<6} {:<6} {:<4} {:<4} {:<4} {:<6} {:<6} {:<6} {:<6} {:<6}".format(
+        "Time","T","H","SM","P","F","A","D","BMP_T","BMP_P","Photo","AWS"
     ), flush=True)
     print("-"*160, flush=True)
 
@@ -247,23 +220,20 @@ def main():
     aws_counter = 0
     aws_status = "0"
     db_status = "0"
+    pump_status = 0
 
-    # Try to connect at startup
     mqtt_connection = connect_aws()
-
-    # track reconnect attempts every N seconds (try every 30s)
     reconnect_attempt_timer = 0
     RECONNECT_INTERVAL = 30
 
     try:
         while True:
-            # read sensors
-            photoresistor_val = read_adc(0)
+            soil_moisture_val = read_adc(0)      # Soil moisture sensor (AIN0)
+            photoresistor_val = read_adc(1)      # Light sensor (AIN1)
             bmp_temp = bmp_sensor.read_temperature()
             try:
                 bmp_pressure = bmp_sensor.read_pressure() / 100.0
             except Exception:
-                # in rare cases BMP library might fail momentarily
                 bmp_pressure = -1.0
             try:
                 bmp_altitude = bmp_sensor.read_altitude()
@@ -271,14 +241,11 @@ def main():
                 bmp_altitude = -1.0
 
             dht_result = read_dht11_dat()
-            soil_state = read_soil_moisture()
-
             if dht_result:
                 dht_humidity, dht_temp = dht_result
             else:
                 dht_humidity, dht_temp = -1, int(bmp_temp)
 
-            # fan control (active LOW assumed)
             if dht_temp is not None and dht_temp >= 25:
                 GPIO.output(FAN_PIN, GPIO.LOW)
                 fan_status = 1
@@ -286,22 +253,21 @@ def main():
                 GPIO.output(FAN_PIN, GPIO.HIGH)
                 fan_status = 0
 
-            # pump control (active LOW assumed)
-            if soil_state == 1:  # dry
+            # Pump logic: ON if soil moisture > 130, OFF if < 110
+            if pump_status == 0 and soil_moisture_val > SOIL_MOISTURE_ON_THRESHOLD:
                 GPIO.output(PUMP_PIN, GPIO.LOW)
                 pump_status = 1
-            else:
+            elif pump_status == 1 and soil_moisture_val < SOIL_MOISTURE_OFF_THRESHOLD:
                 GPIO.output(PUMP_PIN, GPIO.HIGH)
                 pump_status = 0
 
-            # AWS publish every 10s (non-blocking publish; errors handled)
             aws_counter += 1
             if aws_counter >= 10:
                 aws_counter = 0
                 payload = {
                     "dht_temp": dht_temp,
                     "dht_humidity": dht_humidity,
-                    "soil_moisture": soil_state,
+                    "soil_moisture": soil_moisture_val,
                     "fan_status": fan_status,
                     "pump_status": pump_status,
                     "bmp_temp": bmp_temp,
@@ -311,7 +277,6 @@ def main():
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                 }
                 if mqtt_connection is None:
-                    # try to reconnect if possible
                     reconnect_attempt_timer += 1
                     if reconnect_attempt_timer >= RECONNECT_INTERVAL:
                         print("[AWS] Attempting reconnect...", flush=True)
@@ -325,7 +290,6 @@ def main():
                     except Exception as e:
                         print(f"[AWS] Publish failed: {e}", flush=True)
                         aws_status = "E"
-                        # set mqtt_connection to None so we attempt reconnect later
                         try:
                             mqtt_connection.disconnect().result()
                         except Exception:
@@ -334,7 +298,6 @@ def main():
             else:
                 aws_status = "0"
 
-            # SQLite logging (always try, replace missing values with safe defaults)
             safe_dht_temp = float(dht_temp) if isinstance(dht_temp, (int, float)) else -1.0
             safe_dht_humidity = float(dht_humidity) if isinstance(dht_humidity, (int, float)) else -1.0
             safe_bmp_temp = float(bmp_temp) if isinstance(bmp_temp, (int, float)) else -1.0
@@ -350,7 +313,7 @@ def main():
                     VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     safe_dht_temp, safe_dht_humidity, safe_bmp_temp, safe_bmp_pressure, safe_bmp_alt,
-                    int(photoresistor_val), int(soil_state), str(fan_status), str(pump_status), aws_status
+                    int(photoresistor_val), int(soil_moisture_val), str(fan_status), str(pump_status), aws_status
                 ))
                 conn.commit()
                 db_status = "1"
@@ -358,18 +321,15 @@ def main():
                 db_status = "E"
                 print("DB Insert Error:", e, flush=True)
 
-            # update LCD with short format required
-            soil_str = "D" if soil_state == 1 else "W"
-            line1 = f"S={soil_str} P={pump_status} A={aws_status} D={db_status}"
-            line2 = f"T={int(dht_temp)} H={dht_humidity if dht_humidity!=-1 else '--'} F={fan_status}"
+            line1 = f"S:{soil_moisture_val:3d} P:{pump_status} F:{fan_status} D:{db_status}"
+            line2 = f"T:{int(dht_temp):2d} H:{dht_humidity:2d} A:{aws_status} {db_status}"
             update_lcd(line1[:16], line2[:16])
 
-            # Print for console/laptop (clear per-line output)
-            print("{:<6} {:<6} {:<6} {:<4} {:<4} {:<4} {:<4} {:<6} {:<6} {:<6} {:<6} {:<6}".format(
+            print("{:<6} {:<6} {:<6} {:<6} {:<4} {:<4} {:<4} {:<6} {:<6} {:<6} {:<6} {:<6}".format(
                 counter,
                 int(dht_temp) if isinstance(dht_temp, (int,float)) else "--",
                 dht_humidity if dht_humidity != -1 else "--",
-                soil_str,
+                soil_moisture_val,
                 pump_status,
                 fan_status,
                 aws_status,
@@ -397,3 +357,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
