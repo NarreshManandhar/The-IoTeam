@@ -4,7 +4,6 @@ import json
 from awscrt import mqtt
 from awsiot import mqtt_connection_builder
 
-# --- SQLite ---
 def init_db():
     conn = sqlite3.connect("plant_data.db")
     c = conn.cursor()
@@ -15,8 +14,8 @@ def init_db():
         humidity REAL,
         pressure REAL,
         altitude REAL,
-        soil TEXT,
-        light TEXT,
+        soil_moisture INTEGER,
+        light INTEGER,
         pump TEXT,
         fan TEXT
     )''')
@@ -26,12 +25,11 @@ def init_db():
 def log_to_db(data):
     conn = sqlite3.connect("plant_data.db")
     c = conn.cursor()
-    c.execute("INSERT INTO sensor_data (timestamp,temperature,humidity,pressure,altitude,soil,light,pump,fan) VALUES (?,?,?,?,?,?,?,?,?)",
-        (time.strftime("%Y-%m-%d %H:%M:%S"), data["temperature"], data["humidity"], data["pressure"], data["altitude"], data["soil"], data["light"], data["pump"], data["fan"]))
+    c.execute("INSERT INTO sensor_data (timestamp,temperature,humidity,pressure,altitude,soil_moisture,light,pump,fan) VALUES (?,?,?,?,?,?,?,?,?)",
+        (time.strftime("%Y-%m-%d %H:%M:%S"), data["temperature"], data["humidity"], data["pressure"], data["altitude"], data["soil_moisture"], data["light"], data["pump"], data["fan"]))
     conn.commit()
     conn.close()
 
-# --- AWS ---
 def connect_aws():
     mqtt_connection = mqtt_connection_builder.mtls_from_path(
         endpoint="a1y1hr6wej3zxo-ats.iot.ap-southeast-2.amazonaws.com",
